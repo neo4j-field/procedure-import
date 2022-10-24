@@ -3,6 +3,7 @@ package com.neo4j.procedure_import;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
@@ -10,6 +11,9 @@ import java.util.Scanner;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 import org.neo4j.graphdb.Transaction;
 import org.neo4j.kernel.internal.GraphDatabaseAPI;
 import org.neo4j.logging.Log;
@@ -36,33 +40,34 @@ public class ImportCsv {
    @Procedure(name = "com.neo4j.import.file", mode = Mode.WRITE)
    public void importFile(@Name("file") String filePath,
                           @Name("batchSize") Long batchSize,
-                          @Name("threads") Long threads) throws InterruptedException {
+                          @Name("threads") Long threads) {
 
-      try (FileInputStream fileInputStream = new FileInputStream(Paths.get(filePath).toFile());
-           Scanner scanner = new Scanner(fileInputStream, StandardCharsets.UTF_8)) {
+      try {
          createConstraint();
 
          BatchProcessor processor = new BatchProcessor(database, getExecutorService(threads));
 
-         List<String> batch = new ArrayList<>();
          AtomicInteger counter = new AtomicInteger(0);
 
-         while (scanner.hasNextLine()) {
-            batch.add(scanner.nextLine());
-            if (!scanner.hasNextLine() || counter.incrementAndGet() == batchSize) {
-               log.info("Sending data to be processed");
-               processor.ingest(new ArrayList<>(batch));
-               batch.clear();
-               counter.set(0);
-            }
-         }
-         if (scanner.ioException() != null) {
-            log.info("Exception while reading line: %s", scanner.ioException().getMessage());
-            throw scanner.ioException();
-         }
+         Stream<String> lines = Files.lines(Paths.get(filePath))
+               .skip(0)
+               .sorted((o1, o2) -> {
+                  String[] cols1 = o1.split(",");
+                  String[] cols2 = o2.split(",");
+                  return cols1[2].compareTo(cols2[2]) != 0 ? cols1[2].compareTo(cols2[2]) : cols1[3].compareTo(cols2[3]);
+               });
 
+         batches(lines, batchSize)
+               .forEach(batch -> {
+                  try {
+                     processor.ingest(batch);
+                  } catch (InterruptedException e) {
+                     throw new RuntimeException(e);
+                  }
+               });
       } catch (IOException e) {
          log.error("Error while loading file: %s", e.getMessage(), e);
+         throw new RuntimeException(e);
       }
    }
 
@@ -86,5 +91,11 @@ public class ImportCsv {
    private static ExecutorService getExecutorService(Long threads) {
       int availableProcessors = Runtime.getRuntime().availableProcessors();
       return Executors.newFixedThreadPool((threads <= availableProcessors) ? threads.intValue() : availableProcessors);
+   }
+
+   private <T> Stream<List<T>> batches(Stream<T> stream, long batchSize) {
+      return batchSize == 0
+            ? Stream.of(stream.collect(Collectors.toList()))
+            : StreamSupport.stream(new BatchSpliterator<>(stream.spliterator(), batchSize), stream.isParallel());
    }
 }
